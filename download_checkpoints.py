@@ -106,10 +106,6 @@ def get_pipeline():
         ControlNetModel.from_pretrained(
             "lllyasviel/sd-controlnet-mlsd", torch_dtype=torch.float16
         ),
-        ControlNetModel.from_pretrained(
-            "jinxixiang/color_controlnet",
-            torch_dtype=torch.float16
-        )
     ]
     pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
         # "SG161222/Realistic_Vision_V3.0_VAE",

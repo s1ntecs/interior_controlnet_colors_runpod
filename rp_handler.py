@@ -6,7 +6,7 @@ from typing import Any, Dict, Tuple, Union, List, Optional
 
 import numpy as np
 import torch
-from PIL import Image, ImageFilter, ImageDraw
+from PIL import Image, ImageFilter
 from diffusers import (StableDiffusionImg2ImgPipeline,
                        DDIMScheduler)
 
@@ -18,6 +18,9 @@ from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
 from colors import ade_palette
 from utils import map_colors_rgb
+from colorizer import (url_to_pil,
+                      hex_to_rgb, extract_palette_from_image,
+                      get_palette, fill_mask_with_palette)
 
 import runpod
 from runpod.serverless.utils.rp_download import file as rp_file
@@ -127,10 +130,6 @@ controlnet = [
     ControlNetModel.from_pretrained(
         "lllyasviel/sd-controlnet-mlsd", torch_dtype=DTYPE
     ),
-    ControlNetModel.from_pretrained(
-        "jinxixiang/color_controlnet",
-        torch_dtype=DTYPE
-    )
 ]
 
 PIPELINE = StableDiffusionControlNetInpaintPipeline.from_pretrained(
@@ -214,23 +213,6 @@ def segment_image(image):
     return seg_image
 
 
-def build_palette(hex_colors: List[str],
-                  target_size: Tuple[int, int],
-                  cell: int = 64) -> Image.Image:
-    """
-    HEX-список → квадратная картинка, которую ждёт Color-ControlNet.
-    """
-    import math
-    cols = math.ceil(len(hex_colors) ** 0.5)
-    rows = math.ceil(len(hex_colors) / cols)
-    img = Image.new("RGB", (cols * cell, rows * cell))
-    draw = ImageDraw.Draw(img)
-    for i, h in enumerate(hex_colors):
-        r, c = divmod(i, cols)
-        draw.rectangle([c*cell, r*cell, (c+1)*cell, (r+1)*cell], fill=h)
-    return img.resize(target_size, Image.NEAREST)
-
-
 def resize_dimensions(dimensions, target_size):
     """
     Resize PIL to target size while maintaining aspect ratio
@@ -300,11 +282,6 @@ def _switch_lora(lora_name: Optional[str],
 # --------------------------------------------------------------------------- #
 #                                ВСПОМОГАТЕЛЬНЫЕ                              #
 # --------------------------------------------------------------------------- #
-def url_to_pil(url: str) -> Image.Image:
-    info = rp_file(url)
-    return Image.open(info["file_path"]).convert("RGB")
-
-
 def pil_to_b64(img: Image.Image) -> str:
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
@@ -344,19 +321,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         refiner_steps = int(payload.get("refiner_steps", 15))
         refiner_scale = float(payload.get("refiner_scale", 7.5))
 
-        segment_conditioning_scale = float(payload.get("segment_conditioning_scale", 0.4))
-        segment_guidance_start = float(payload.get("segment_guidance_start", 0.0))
+        segment_conditioning_scale = float(payload.get(
+            "segment_conditioning_scale", 0.4))
+        segment_guidance_start = float(payload.get("segment_guidance_start",
+                                                   0.0))
         segment_guidance_end = float(payload.get("segment_guidance_end", 0.5))
-        mlsd_conditioning_scale = float(payload.get("mlsd_conditioning_scale", 0.2))
+        mlsd_conditioning_scale = float(payload.get("mlsd_conditioning_scale",
+                                                    0.2))
         mlsd_guidance_start = float(payload.get("mlsd_guidance_start", 0.1))
         mlsd_guidance_end = float(payload.get("mlsd_guidance_end", 0.25))
 
         mask_blur_radius = float(payload.get("mask_blur_radius", 3))
 
-        palette_hex = payload.get("palette")                 # ["#ECECEC", …]
-        palette_scale = float(payload.get("palette_scale", 0.8))
-        palette_scale_start = float(payload.get("palette_scale_start", 0.0))
-        palette_scale_end = float(payload.get("palette_scale_end", 1.0))
+        palette_rgb = get_palette(payload)   # список RGB-троек
 
         # ----------------- handle LoRA ----------------- #
         error = _switch_lora(payload.get("lora"),
@@ -398,22 +375,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         mlsd_img = mlsd_processor(input_image)
         mlsd_img = mlsd_img.resize(image.size)
 
-        if palette_hex:
-            palette_cond_image = build_palette(palette_hex, image.size)
-        else:
-            palette_cond_image = None
-
-        # ------------------- prepare control images -------------------- #
-        control_images = [segmentation_cond_image, mlsd_img]
-        scales = [segment_conditioning_scale, mlsd_conditioning_scale]
-        starts = [segment_guidance_start,     mlsd_guidance_start]
-        ends = [segment_guidance_end,       mlsd_guidance_end]
-
-        if palette_cond_image:          # третья ControlNet-карта
-            control_images.append(palette_cond_image)
-            scales.append(palette_scale)  # 0.6–0.9 – мягко; 1.0 – очень жёстко
-            starts.append(palette_scale_start)           # запускаем почти сразу
-            ends.append(palette_scale_end)              # держим до конца
+        colored_base = fill_mask_with_palette(
+            input_image, mask_image, palette_rgb)
         # ------------------- generation -------------------- #
         images = PIPELINE(
             prompt=prompt,
@@ -422,12 +385,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             strength=prompt_strength,
             guidance_scale=guidance_scale,
             generator=generator,
-            image=image,
+            image=colored_base,
             mask_image=mask_image,
-            control_image=control_images,
-            controlnet_conditioning_scale=scales,
-            control_guidance_start=starts,
-            control_guidance_end=ends,
+            control_image=[segmentation_cond_image, mlsd_img],
+            controlnet_conditioning_scale=[segment_conditioning_scale,
+                                           mlsd_conditioning_scale],
+            control_guidance_start=[segment_guidance_start,
+                                    mlsd_guidance_start],
+            control_guidance_end=[segment_guidance_end,
+                                  mlsd_guidance_end],
             num_images_per_prompt=num_images
         ).images
 
