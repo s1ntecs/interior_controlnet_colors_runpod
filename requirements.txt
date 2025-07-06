@@ -9,7 +9,7 @@ pandas==2.1.4
 controlnet-aux
 Pillow
 mediapipe
-
+scikit-learn
 huggingface-hub==0.25.0
 
 aiohttp
